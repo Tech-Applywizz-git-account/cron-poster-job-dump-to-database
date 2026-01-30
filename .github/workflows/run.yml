@@ -19,13 +19,9 @@ jobs:
           pip install -r requirements.txt
       - name: Run LinkedIn Job Postings Report
         env:
-          # Azure AD Configuration (Microsoft Graph API)
-          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
-          # Database Configuration
+          # Source Database (Read)
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          # Email Configuration (Optional)
-          CC_EMAIL_RECIPIENTS: ${{ secrets.CC_EMAIL_RECIPIENTS }}
+          # Destination Database (Supabase Write)
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: python api_send_email_notification.py
