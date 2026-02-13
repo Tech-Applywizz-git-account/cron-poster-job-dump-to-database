@@ -1,7 +1,7 @@
 name: LinkedIn Job Postings Daily Report
 on:
   schedule:
-    - cron: "30 4 * * *"  # Runs every day at 10:00 AM IST (4:30 UTC)
+    - cron: "0 13 * * *"  # Runs every day at 6:30 PM IST (13:00 UTC)
   workflow_dispatch:      # Allows manual trigger
 jobs:
   linkedin-jobs-report:
