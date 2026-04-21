@@ -196,7 +196,6 @@ def process_linkedin_jobs(target_date: Optional[str] = None):
 def health_check():
     return {"status": "ok", "service": "LinkedIn Job Postings Processor API"}
 
-
 # -----------------------
 # Main execution when run as script (for cron jobs)
 # -----------------------
