@@ -51,9 +51,6 @@ REPORT_RECIPIENT = "dinesh@applywizz.ai"
 
 APP_NAME = "LinkedIn Job Postings Report"
 
-# Temporary: always pull this calendar day from DATABASE_URL (ignore run time / today)
-FIXED_REPORT_DATE = "2026-10-26"
-
 # FastAPI app
 app = FastAPI()
 
@@ -76,19 +73,12 @@ def get_db_connection():
 # -----------------------
 def get_linkedin_job_postings(target_date: Optional[str] = None):
     """
-    Query the karmafy_job table to find all LinkedIn job postings for a specific date
-    that have a poster profile.
-    
-    Args:
-        target_date: Date in 'YYYY-MM-DD' format. Currently forced to FIXED_REPORT_DATE.
-    
-    Returns list of dicts with job posting information.
+    Query the karmafy_job table for LinkedIn job postings that have a poster profile.
+
+    For now (USE_ANY_AVAILABLE_DATES): no date filter — returns whatever dates have data.
     """
     conn = get_db_connection()
     try:
-        # For now: always use FIXED_REPORT_DATE regardless of call time / args
-        target_date = FIXED_REPORT_DATE
-        
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             query = """
                 SELECT DISTINCT ON (kj.posted_by_profile)
@@ -99,21 +89,27 @@ def get_linkedin_job_postings(target_date: Optional[str] = None):
                     kj.posted_by_profile,
                     kj.source,
                     kj.title,
-                    kjr.name AS job_role
+                    kjr.name AS job_role,
+                    DATE(kj."ingestedAt") AS ingested_date
                 FROM public.karmafy_job kj
                 LEFT JOIN public.karmafy_jobrole kjr
                     ON kj."roleId"::bigint = kjr.id
                 WHERE kj.source = 'LINKEDIN'
-                    AND DATE(kj."ingestedAt") = %s
                     AND kj.posted_by_profile IS NOT NULL
                     AND kj.posted_by_profile != ''
-                ORDER BY kj.posted_by_profile, kj.company, kj.title
+                ORDER BY kj.posted_by_profile, kj."ingestedAt" DESC NULLS LAST, kj.company, kj.title
             """
-            cursor.execute(query, (target_date,))
+            cursor.execute(query)
             results = cursor.fetchall()
-            
-            # Convert to list of dicts
-            return [dict(row) for row in results]
+
+            rows = []
+            for row in results:
+                item = dict(row)
+                ingested = item.get("ingested_date")
+                if ingested is not None:
+                    item["ingested_date"] = ingested.strftime("%Y-%m-%d")
+                rows.append(item)
+            return rows
     
     except psycopg2.Error as e:
         print(f"❌ Database query error: {e}")
@@ -131,7 +127,7 @@ def insert_jobs_to_supabase(jobs_data: list, target_date: str) -> None:
     
     Args:
         jobs_data: List of job posting dictionaries
-        target_date: Date string YYYY-MM-DD
+        target_date: Fallback date string YYYY-MM-DD when a row has no ingested_date
     """
     try:
         supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -148,7 +144,7 @@ def insert_jobs_to_supabase(jobs_data: list, target_date: str) -> None:
                 'job_url': job.get('url'),
                 'company_url': job.get('company_url'),
                 'source': job.get('source'),
-                'report_date': target_date
+                'report_date': job.get('ingested_date') or target_date
             })
             
         if not records_to_insert:
@@ -286,28 +282,39 @@ def send_daily_report_email(records: list, target_date: str) -> None:
 @app.post("/process-linkedin-jobs")
 def process_linkedin_jobs(target_date: Optional[str] = None):
     """
-    Get all LinkedIn job postings for FIXED_REPORT_DATE that have poster profiles
-    and store them in Supabase.
+    Get LinkedIn job postings with poster profiles from any available dates,
+    store them in Supabase, and email the report.
     """
-    # For now: always process 2026-10-26 data from DATABASE_URL
-    target_date = FIXED_REPORT_DATE
+    run_date = datetime.now().strftime("%Y-%m-%d")
 
-    print(f"🔍 Fetching LinkedIn jobs for date: {target_date}")
+    print("🔍 Fetching LinkedIn jobs for any available dates (no date filter)...")
 
     # Query database for LinkedIn job postings
-    job_postings = get_linkedin_job_postings(target_date)
+    job_postings = get_linkedin_job_postings()
     
     if not job_postings:
         return {
             "success": True,
-            "message": f"No LinkedIn job postings found for {target_date}!",
+            "message": "No LinkedIn job postings with poster profiles found!",
             "jobs_count": 0,
             "inserted": False,
             "emailed": False
         }
+
+    available_dates = sorted({
+        job.get("ingested_date")
+        for job in job_postings
+        if job.get("ingested_date")
+    })
+    report_label = (
+        f"{available_dates[0]} to {available_dates[-1]}"
+        if len(available_dates) > 1
+        else (available_dates[0] if available_dates else run_date)
+    )
+    print(f"📅 Available ingested dates in result: {available_dates}")
     
-    # Insert jobs into Supabase
-    insert_jobs_to_supabase(job_postings, target_date)
+    # Insert jobs into Supabase (report_date per row uses each job's ingested_date)
+    insert_jobs_to_supabase(job_postings, report_label)
     
     print(f"✅ Processing completed for {len(job_postings)} jobs")
    
@@ -319,7 +326,8 @@ def process_linkedin_jobs(target_date: Optional[str] = None):
         "emailed": True,
         "email_to": REPORT_RECIPIENT,
         "email_from": SENDER_EMAIL,
-        "date": target_date
+        "date": report_label,
+        "available_dates": available_dates,
     }
 
 
