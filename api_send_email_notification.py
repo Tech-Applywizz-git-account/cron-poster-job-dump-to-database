@@ -9,10 +9,18 @@ import io
 import os
 import re
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import psycopg2
 import requests
 from psycopg2.extras import RealDictCursor
 from supabase import create_client, Client
+
+IST = ZoneInfo("Asia/Kolkata")
+
+
+def today_ist() -> str:
+    """Current calendar date in IST (YYYY-MM-DD)."""
+    return datetime.now(IST).strftime("%Y-%m-%d")
 
 # -----------------------
 # Config - Load from environment variables
@@ -74,10 +82,12 @@ def get_db_connection():
 # -----------------------
 def get_linkedin_job_postings(target_date: Optional[str] = None):
     """
-    Query the karmafy_job table for LinkedIn job postings that have a poster profile.
-
-    For now (USE_ANY_AVAILABLE_DATES): no date filter — returns whatever dates have data.
+    Query the karmafy_job table for LinkedIn job postings that have a poster profile
+    for the given calendar date (defaults to today's date in IST).
     """
+    if target_date is None:
+        target_date = today_ist()
+
     conn = get_db_connection()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
@@ -91,16 +101,18 @@ def get_linkedin_job_postings(target_date: Optional[str] = None):
                     kj.source,
                     kj.title,
                     kjr.name AS job_role,
+                    kj.location,
                     DATE(kj."ingestedAt") AS ingested_date
                 FROM public.karmafy_job kj
                 LEFT JOIN public.karmafy_jobrole kjr
                     ON kj."roleId"::bigint = kjr.id
                 WHERE kj.source = 'LINKEDIN'
+                    AND DATE(kj."ingestedAt") = %s
                     AND kj.posted_by_profile IS NOT NULL
                     AND kj.posted_by_profile != ''
                 ORDER BY kj.posted_by_profile, kj."ingestedAt" DESC NULLS LAST, kj.company, kj.title
             """
-            cursor.execute(query)
+            cursor.execute(query, (target_date,))
             results = cursor.fetchall()
 
             rows = []
@@ -300,43 +312,33 @@ def send_daily_report_email(records: list, target_date: str) -> None:
 @app.post("/process-linkedin-jobs")
 def process_linkedin_jobs(target_date: Optional[str] = None):
     """
-    Get LinkedIn job postings with poster profiles from any available dates,
-    try to store them in Supabase, and always email the CSV report.
+    Get LinkedIn job postings with poster profiles for the current IST date
+    (or an optional target_date), try Supabase insert, and always email the CSV.
     """
-    run_date = datetime.now().strftime("%Y-%m-%d")
+    if target_date is None:
+        target_date = today_ist()
 
-    print("🔍 Fetching LinkedIn jobs for any available dates (no date filter)...")
+    print(f"🔍 Fetching LinkedIn jobs for date: {target_date}")
 
-    job_postings = get_linkedin_job_postings()
+    job_postings = get_linkedin_job_postings(target_date)
     
     if not job_postings:
         return {
             "success": True,
-            "message": "No LinkedIn job postings with poster profiles found!",
+            "message": f"No LinkedIn job postings found for {target_date}!",
             "jobs_count": 0,
             "inserted": False,
-            "emailed": False
+            "emailed": False,
+            "date": target_date,
         }
 
-    available_dates = sorted({
-        job.get("ingested_date")
-        for job in job_postings
-        if job.get("ingested_date")
-    })
-    report_label = (
-        f"{available_dates[0]} to {available_dates[-1]}"
-        if len(available_dates) > 1
-        else (available_dates[0] if available_dates else run_date)
-    )
-    print(f"📅 Available ingested dates in result: {available_dates}")
-
-    records = build_report_records(job_postings, report_label)
+    records = build_report_records(job_postings, target_date)
 
     # Supabase is best-effort — email still goes out if this fails
     inserted = insert_jobs_to_supabase(records)
 
     try:
-        send_daily_report_email(records, report_label)
+        send_daily_report_email(records, target_date)
         emailed = True
     except Exception as e:
         print(f"❌ Error sending daily report email: {e}")
@@ -347,7 +349,7 @@ def process_linkedin_jobs(target_date: Optional[str] = None):
     return {
         "success": True,
         "message": (
-            f"Found {len(job_postings)} LinkedIn job posting(s); "
+            f"Found {len(job_postings)} LinkedIn job posting(s) for {target_date}; "
             f"emailed {REPORT_RECIPIENT}"
             + ("; stored in Supabase." if inserted else "; Supabase insert skipped/failed.")
         ),
@@ -356,8 +358,7 @@ def process_linkedin_jobs(target_date: Optional[str] = None):
         "emailed": emailed,
         "email_to": REPORT_RECIPIENT,
         "email_from": SENDER_EMAIL,
-        "date": report_label,
-        "available_dates": available_dates,
+        "date": target_date,
     }
 
 
