@@ -3,11 +3,12 @@
 from fastapi import FastAPI, HTTPException
 from typing import Optional
 import base64
+import csv
 import html
 import io
 import os
+import re
 from datetime import datetime
-import pandas as pd
 import psycopg2
 import requests
 from psycopg2.extras import RealDictCursor
@@ -119,53 +120,62 @@ def get_linkedin_job_postings(target_date: Optional[str] = None):
 
 
 # -----------------------
-# Insert into Supabase
+# Report records + Supabase insert
 # -----------------------
-def insert_jobs_to_supabase(jobs_data: list, target_date: str) -> None:
+REPORT_COLUMNS = [
+    ("company", "Company"),
+    ("job_title", "Job title"),
+    ("job_role", "Job role"),
+    ("poster_full_name", "Poster"),
+    ("poster_profile_url", "Poster profile"),
+    ("job_url", "Job URL"),
+    ("company_url", "Company URL"),
+    ("source", "Source"),
+    ("report_date", "Report date"),
+]
+
+
+def build_report_records(jobs_data: list, target_date: str) -> list:
+    """Map source DB rows into the report / Supabase payload shape."""
+    records = []
+    for job in jobs_data:
+        records.append({
+            "company": job.get("company"),
+            "job_title": job.get("title"),
+            "job_role": job.get("job_role"),
+            "poster_full_name": job.get("poster_full_name"),
+            "poster_profile_url": job.get("posted_by_profile"),
+            "job_url": job.get("url"),
+            "company_url": job.get("company_url"),
+            "source": job.get("source"),
+            "report_date": job.get("ingested_date") or target_date,
+        })
+    return records
+
+
+def insert_jobs_to_supabase(records_to_insert: list) -> bool:
     """
-    Insert job postings data into Supabase 'daily_linkedin_jobs_report' table.
-    
-    Args:
-        jobs_data: List of job posting dictionaries
-        target_date: Fallback date string YYYY-MM-DD when a row has no ingested_date
+    Insert job postings into Supabase.
+    Returns True on success. On failure logs the error and returns False
+    (does not raise — email should still be sent).
     """
+    if not records_to_insert:
+        print("ℹ️ No records to insert.")
+        return False
+
     try:
         supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        
-        # Prepare data for insertion
-        records_to_insert = []
-        for job in jobs_data:
-            records_to_insert.append({
-                'company': job.get('company'),
-                'job_title': job.get('title'),
-                'job_role': job.get('job_role'),
-                'poster_full_name': job.get('poster_full_name'),
-                'poster_profile_url': job.get('posted_by_profile'),
-                'job_url': job.get('url'),
-                'company_url': job.get('company_url'),
-                'source': job.get('source'),
-                'report_date': job.get('ingested_date') or target_date
-            })
-            
-        if not records_to_insert:
-            print("ℹ️ No records to insert.")
-            return
-
-        # Perform insertion
-        # Note: If handling large datasets, consider batching (e.g., chunks of 100)
-        data = supabase.table("daily_linkedin_jobs_report").insert(records_to_insert).execute()
-        
+        # Batch to avoid oversized payloads
+        batch_size = 500
+        for i in range(0, len(records_to_insert), batch_size):
+            batch = records_to_insert[i : i + batch_size]
+            supabase.table("daily_linkedin_jobs_report").insert(batch).execute()
+            print(f"✅ Inserted Supabase batch {i // batch_size + 1} ({len(batch)} rows)")
         print(f"✅ Successfully inserted {len(records_to_insert)} records into Supabase.")
-        
+        return True
     except Exception as e:
-        print(f"❌ Error inserting into Supabase: {e}")
-        raise HTTPException(status_code=500, detail=f"Supabase insertion failed: {str(e)}")
-
-    try:
-        send_daily_report_email(records_to_insert, target_date)
-    except Exception as e:
-        print(f"❌ Error sending daily report email: {e}")
-        raise HTTPException(status_code=500, detail=f"Daily report email failed: {str(e)}")
+        print(f"⚠️ Supabase insertion failed (continuing to email): {e}")
+        return False
 
 
 # -----------------------
@@ -196,30 +206,32 @@ def _get_graph_access_token() -> str:
     return token
 
 
-def _report_html(records: list, target_date: str) -> str:
-    columns = [
-        ("company", "Company"),
-        ("job_title", "Job title"),
-        ("job_role", "Job role"),
-        ("poster_full_name", "Poster"),
-        ("poster_profile_url", "Poster profile"),
-        ("job_url", "Job URL"),
-        ("company_url", "Company URL"),
-        ("source", "Source"),
-        ("report_date", "Report date"),
-    ]
-    header = "".join(f"<th>{html.escape(label)}</th>" for _, label in columns)
+def _safe_filename_date(target_date: str) -> str:
+    return re.sub(r"[^0-9A-Za-z._-]+", "_", target_date).strip("_") or "report"
+
+
+def _report_html(records: list, target_date: str, preview_limit: int = 50) -> str:
+    header = "".join(f"<th>{html.escape(label)}</th>" for _, label in REPORT_COLUMNS)
+    preview = records[:preview_limit]
     rows = []
-    for record in records:
+    for record in preview:
         cells = "".join(
             f"<td>{html.escape('' if record.get(key) is None else str(record.get(key)))}</td>"
-            for key, _ in columns
+            for key, _ in REPORT_COLUMNS
         )
         rows.append(f"<tr>{cells}</tr>")
 
+    extra = ""
+    if len(records) > preview_limit:
+        extra = (
+            f"<p>Showing first {preview_limit} of {len(records)} rows. "
+            "Full data is in the CSV attachment.</p>"
+        )
+
     return f"""
-    <p>Daily LinkedIn job postings for <strong>{html.escape(target_date)}</strong>.</p>
-    <p>{len(records)} posting(s) were stored in the daily report.</p>
+    <p>LinkedIn job postings for <strong>{html.escape(target_date)}</strong>.</p>
+    <p>{len(records)} posting(s) in this report. Full list is attached as CSV.</p>
+    {extra}
     <table border="1" cellpadding="6" cellspacing="0">
         <thead><tr>{header}</tr></thead>
         <tbody>{''.join(rows)}</tbody>
@@ -227,23 +239,29 @@ def _report_html(records: list, target_date: str) -> str:
     """
 
 
-def _report_excel_bytes(records: list) -> bytes:
-    buffer = io.BytesIO()
-    pd.DataFrame(records).to_excel(buffer, index=False, sheet_name="LinkedIn jobs")
-    return buffer.getvalue()
+def _report_csv_bytes(records: list) -> bytes:
+    buffer = io.StringIO()
+    fieldnames = [key for key, _ in REPORT_COLUMNS]
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    for record in records:
+        writer.writerow({key: ("" if record.get(key) is None else record.get(key)) for key in fieldnames})
+    return buffer.getvalue().encode("utf-8-sig")
 
 
 def send_daily_report_email(records: list, target_date: str) -> None:
     """
-    Email the same daily rows written to Supabase.
+    Email report rows as CSV.
     From support@applywizz.ai (or SENDER_EMAIL) to dinesh@applywizz.ai.
+    Runs independently of Supabase success/failure.
     """
     if not records:
         print("ℹ️ No records to email.")
         return
 
     token = _get_graph_access_token()
-    attachment = base64.b64encode(_report_excel_bytes(records)).decode("ascii")
+    attachment = base64.b64encode(_report_csv_bytes(records)).decode("ascii")
+    file_stem = _safe_filename_date(target_date)
     payload = {
         "message": {
             "subject": f"{APP_NAME}: {len(records)} LinkedIn job posting(s) - {target_date}",
@@ -252,8 +270,8 @@ def send_daily_report_email(records: list, target_date: str) -> None:
             "attachments": [
                 {
                     "@odata.type": "#microsoft.graph.fileAttachment",
-                    "name": f"linkedin_jobs_{target_date}.xlsx",
-                    "contentType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    "name": f"linkedin_jobs_{file_stem}.csv",
+                    "contentType": "text/csv",
                     "contentBytes": attachment,
                 }
             ],
@@ -267,7 +285,7 @@ def send_daily_report_email(records: list, target_date: str) -> None:
             "Content-Type": "application/json",
         },
         json=payload,
-        timeout=60,
+        timeout=120,
     )
     if response.status_code not in (200, 202):
         raise RuntimeError(
@@ -283,13 +301,12 @@ def send_daily_report_email(records: list, target_date: str) -> None:
 def process_linkedin_jobs(target_date: Optional[str] = None):
     """
     Get LinkedIn job postings with poster profiles from any available dates,
-    store them in Supabase, and email the report.
+    try to store them in Supabase, and always email the CSV report.
     """
     run_date = datetime.now().strftime("%Y-%m-%d")
 
     print("🔍 Fetching LinkedIn jobs for any available dates (no date filter)...")
 
-    # Query database for LinkedIn job postings
     job_postings = get_linkedin_job_postings()
     
     if not job_postings:
@@ -312,18 +329,31 @@ def process_linkedin_jobs(target_date: Optional[str] = None):
         else (available_dates[0] if available_dates else run_date)
     )
     print(f"📅 Available ingested dates in result: {available_dates}")
+
+    records = build_report_records(job_postings, report_label)
+
+    # Supabase is best-effort — email still goes out if this fails
+    inserted = insert_jobs_to_supabase(records)
+
+    try:
+        send_daily_report_email(records, report_label)
+        emailed = True
+    except Exception as e:
+        print(f"❌ Error sending daily report email: {e}")
+        raise HTTPException(status_code=500, detail=f"Daily report email failed: {str(e)}")
     
-    # Insert jobs into Supabase (report_date per row uses each job's ingested_date)
-    insert_jobs_to_supabase(job_postings, report_label)
-    
-    print(f"✅ Processing completed for {len(job_postings)} jobs")
+    print(f"✅ Processing completed for {len(job_postings)} jobs (inserted={inserted}, emailed={emailed})")
    
     return {
         "success": True,
-        "message": f"Found and stored {len(job_postings)} LinkedIn job posting(s) into Supabase and emailed {REPORT_RECIPIENT}.",
+        "message": (
+            f"Found {len(job_postings)} LinkedIn job posting(s); "
+            f"emailed {REPORT_RECIPIENT}"
+            + ("; stored in Supabase." if inserted else "; Supabase insert skipped/failed.")
+        ),
         "jobs_count": len(job_postings),
-        "inserted": True,
-        "emailed": True,
+        "inserted": inserted,
+        "emailed": emailed,
         "email_to": REPORT_RECIPIENT,
         "email_from": SENDER_EMAIL,
         "date": report_label,
