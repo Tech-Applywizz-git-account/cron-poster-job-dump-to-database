@@ -51,6 +51,9 @@ REPORT_RECIPIENT = "dinesh@applywizz.ai"
 
 APP_NAME = "LinkedIn Job Postings Report"
 
+# Temporary: always pull this calendar day from DATABASE_URL (ignore run time / today)
+FIXED_REPORT_DATE = "2026-10-26"
+
 # FastAPI app
 app = FastAPI()
 
@@ -77,15 +80,14 @@ def get_linkedin_job_postings(target_date: Optional[str] = None):
     that have a poster profile.
     
     Args:
-        target_date: Date in 'YYYY-MM-DD' format. Defaults to today's date if not provided.
+        target_date: Date in 'YYYY-MM-DD' format. Currently forced to FIXED_REPORT_DATE.
     
     Returns list of dicts with job posting information.
     """
     conn = get_db_connection()
     try:
-        # If no date provided, use today's date
-        if target_date is None:
-            target_date = datetime.now().strftime('%Y-%m-%d')
+        # For now: always use FIXED_REPORT_DATE regardless of call time / args
+        target_date = FIXED_REPORT_DATE
         
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             query = """
@@ -284,11 +286,11 @@ def send_daily_report_email(records: list, target_date: str) -> None:
 @app.post("/process-linkedin-jobs")
 def process_linkedin_jobs(target_date: Optional[str] = None):
     """
-    Get all LinkedIn job postings from today (or target_date) that have poster profiles
+    Get all LinkedIn job postings for FIXED_REPORT_DATE that have poster profiles
     and store them in Supabase.
     """
-    if target_date is None:
-        target_date = datetime.now().strftime('%Y-%m-%d')
+    # For now: always process 2026-10-26 data from DATABASE_URL
+    target_date = FIXED_REPORT_DATE
 
     print(f"🔍 Fetching LinkedIn jobs for date: {target_date}")
 
